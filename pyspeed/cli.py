@@ -138,7 +138,8 @@ def _dashboard(snapshot: core.StatsSnapshot, phase: str,
     status = snapshot.last_error or f"{phase.upper()}  ·  Ctrl+C to stop"
     footer = Panel(Text(status, style="yellow" if snapshot.last_error else "dim"),
                    border_style="grey35", box=box.ROUNDED, padding=(0, 1))
-    return Group(header, metrics, windows, details, latency, footer)
+    event_panel = _event_panel(snapshot.events)
+    return Group(header, metrics, windows, details, latency, event_panel, footer)
 
 
 def _health_table(ping: str, jitter: str, loss: float,
@@ -150,6 +151,22 @@ def _health_table(ping: str, jitter: str, loss: float,
     table.add_row(Text(f"packet loss {loss:.1f}%", style="dim"))
     table.add_row(_inline_bars(latency_history, "yellow", width=18))
     return table
+
+
+def _event_panel(events: tuple[core.DiagnosticEvent, ...]) -> Panel:
+    table = Table.grid(padding=(0, 1))
+    table.add_column(style="dim")
+    table.add_column()
+    recent = events[-3:]
+    if not recent:
+        table.add_row("EVENTS", "No anomalies detected")
+    else:
+        for event in recent:
+            stamp = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
+            style = "red" if event.severity == "critical" else "yellow" if event.severity == "warning" else "dim"
+            table.add_row(Text(stamp, style="dim"), Text(event.message, style=style))
+    return Panel(table, title="[bold bright_white]EVENT TIMELINE[/bold bright_white]",
+                 border_style="grey35", box=box.ROUNDED, padding=(0, 1))
 
 
 def _configure_logging(path: str) -> tuple[logging.Logger, logging.Handler]:
@@ -282,6 +299,8 @@ def main(download_bytes: int, upload_bytes: int, timeout: float,
               refresh_per_second=1000 / refresh, screen=True) as live:
             next_log = 0.0
             while not stop_requested:
+                snapshot = stats.snapshot()
+                stats.detect_events()
                 snapshot = stats.snapshot()
                 live.update(_dashboard(snapshot, "running", show_graph=not no_graph))
                 if snapshot.elapsed_seconds >= next_log:

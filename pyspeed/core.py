@@ -50,6 +50,14 @@ class PingResult:
 
 
 @dataclass(frozen=True)
+class DiagnosticEvent:
+    timestamp: float
+    severity: Literal["info", "warning", "critical"]
+    kind: str
+    message: str
+
+
+@dataclass(frozen=True)
 class StatsSnapshot:
     elapsed_seconds: float
     current_download_mbps: float
@@ -79,6 +87,7 @@ class StatsSnapshot:
     download_stddev_mbps: float
     upload_stddev_mbps: float
     stability: str
+    events: tuple[DiagnosticEvent, ...] = ()
     latency_history: tuple[float, ...] = ()
     download_history: tuple[float, ...] = ()
     upload_history: tuple[float, ...] = ()
@@ -113,6 +122,9 @@ class SessionStats:
         self._idle_ping: float | None = None
         self._reconnects = 0
         self._temporary_failures = 0
+        self._events: deque[DiagnosticEvent] = deque(maxlen=32)
+        self._event_cooldowns: dict[str, float] = {}
+        self._drop_streak = {"download": 0, "upload": 0}
 
     def record_transfer(self, direction: Literal["download", "upload"], amount: int) -> None:
         now = time.monotonic()
@@ -161,6 +173,38 @@ class SessionStats:
     def record_error(self, message: str) -> None:
         with self._lock:
             self._last_error = message
+
+    def add_event(self, severity: Literal["info", "warning", "critical"],
+                  kind: str, message: str, cooldown: float = 30.0) -> bool:
+        now = time.time()
+        with self._lock:
+            if now - self._event_cooldowns.get(kind, 0.0) < cooldown:
+                return False
+            self._event_cooldowns[kind] = now
+            self._events.append(DiagnosticEvent(now, severity, kind, message))
+            return True
+
+    def detect_events(self, drop_threshold: float = 40.0) -> None:
+        """Detect sustained anomalies; cooldowns prevent noisy alert storms."""
+        snapshot = self.snapshot()
+        for direction, current, baseline in (
+            ("download", snapshot.download_1s_mbps, snapshot.download_60s_mbps),
+            ("upload", snapshot.upload_1s_mbps, snapshot.upload_60s_mbps),
+        ):
+            if baseline > 1.0 and current < baseline * (1 - drop_threshold / 100):
+                self._drop_streak[direction] += 1
+            else:
+                self._drop_streak[direction] = 0
+            if self._drop_streak[direction] >= 3:
+                drop = (1 - current / baseline) * 100
+                self.add_event("warning", f"{direction}_drop",
+                               f"{direction.title()} throughput dropped {drop:.0f}% below its recent baseline")
+        if snapshot.latency_increase_ms is not None and snapshot.latency_increase_ms >= 50:
+            self.add_event("warning", "bufferbloat",
+                           f"Loaded latency increased by {snapshot.latency_increase_ms:.0f} ms; this may indicate bufferbloat")
+        if snapshot.last_error:
+            self.add_event("warning", "connection",
+                           f"Connection issue detected: {snapshot.last_error}")
 
     def snapshot(self) -> StatsSnapshot:
         now = time.monotonic()
@@ -213,6 +257,7 @@ class SessionStats:
                 download_stddev_mbps=_stddev(download_values),
                 upload_stddev_mbps=_stddev(upload_values),
                 stability=_stability(loss, _stddev(download_values), _stddev(upload_values)),
+                events=tuple(self._events),
                 download_history=tuple(self._download_history),
                 upload_history=tuple(self._upload_history),
                 latency_history=tuple(self._latency_history),

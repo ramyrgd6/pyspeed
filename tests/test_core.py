@@ -167,3 +167,23 @@ def test_snapshot_contains_latency_and_rolling_metrics():
     assert snapshot.download_1s_mbps >= 0.0
     assert snapshot.upload_60s_mbps >= 0.0
     assert snapshot.stability in {"Excellent", "Good", "Fair", "Unstable"}
+
+
+def test_event_detector_requires_sustained_drop_and_uses_cooldown(monkeypatch):
+    stats = core.SessionStats()
+    stats._transfer_samples["download"].append(
+        (time.monotonic() - 30, 600_000_000, 80.0),
+    )
+    for _ in range(3):
+        stats._transfer_samples["download"].append((time.monotonic(), 1_000, 10.0))
+        stats._download_history.append(10.0)
+        stats._download_current = 10.0
+
+    stats.detect_events(drop_threshold=40)
+    stats.detect_events(drop_threshold=40)
+    stats.detect_events(drop_threshold=40)
+
+    events = stats.snapshot().events
+    assert len(events) == 1
+    assert events[0].kind == "download_drop"
+    assert events[0].severity == "warning"

@@ -82,6 +82,9 @@ pyspeed --bytes 10000000 --upload-bytes 5000000
   official standardized grade.
 - **Statistics** track totals, elapsed time, jitter, packet loss, variance,
   stability, and bounded scrolling histories while the UI redraws in place.
+- **Events** surface sustained download/upload drops, loaded-latency spikes,
+  and connection failures in a bounded timeline. Alerts require repeated
+  abnormal samples and use cooldowns to avoid noisy false-positive storms.
 
 The project deliberately has a small surface area: `pyspeed.core` contains the
 measurement logic, while `pyspeed.cli` owns the live terminal presentation.
@@ -104,6 +107,9 @@ Continuous mode creates sustained traffic. Use it only on connections and
 endpoints you control or are authorized to load. Cloudflare's public endpoint
 is suitable for short personal tests; stop the monitor rather than leaving a
 public service under load indefinitely.
+
+The stability label is a diagnostic estimate based on measured throughput
+variation, latency behavior, and packet loss. It is not an official ISP score.
 
 ## License
 
