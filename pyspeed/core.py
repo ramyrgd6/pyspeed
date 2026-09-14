@@ -109,6 +109,10 @@ def measure_download(total_bytes: int = DEFAULT_DOWNLOAD_BYTES, timeout: float =
                 continue
             downloaded += len(chunk)
             yield (time.perf_counter() - start, downloaded)
+    if downloaded != total_bytes:
+        raise ConnectionError(
+            f"Download incomplete: received {downloaded} of {total_bytes} bytes."
+        )
 
 
 def _validate_transfer(total_bytes: int, timeout: float) -> None:
@@ -118,13 +122,24 @@ def _validate_transfer(total_bytes: int, timeout: float) -> None:
         raise ValueError("timeout must be greater than 0")
 
 
-def _upload_chunks(total_bytes: int):
-    """Yield random-byte chunks to act as the upload request body."""
-    remaining = total_bytes
-    while remaining > 0:
-        size = min(CHUNK_SIZE, remaining)
-        remaining -= size
-        yield os.urandom(size)
+class _UploadStream:
+    """File-like random data stream that preserves a fixed request length."""
+
+    def __init__(self, total_bytes: int, progress: dict[str, int], lock):
+        self.remaining = total_bytes
+        self.progress = progress
+        self.lock = lock
+
+    def read(self, size: int = -1) -> bytes:
+        if self.remaining <= 0:
+            return b""
+        if size < 0:
+            size = CHUNK_SIZE
+        size = min(size, CHUNK_SIZE, self.remaining)
+        self.remaining -= size
+        with self.lock:
+            self.progress["sent"] += size
+        return os.urandom(size)
 
 
 def measure_upload(total_bytes: int = DEFAULT_UPLOAD_BYTES, timeout: float = 20.0):
@@ -142,18 +157,13 @@ def measure_upload(total_bytes: int = DEFAULT_UPLOAD_BYTES, timeout: float = 20.
     progress = {"sent": 0, "done": False, "error": None}
     lock = threading.Lock()
 
-    def tracking_gen():
-        for chunk in _upload_chunks(total_bytes):
-            with lock:
-                progress["sent"] += len(chunk)
-            yield chunk
-
     def worker():
         try:
             session = _session()
+            stream = _UploadStream(total_bytes, progress, lock)
             response = session.post(
                 UP_URL,
-                data=tracking_gen(),
+                data=stream,
                 headers={"Content-Length": str(total_bytes)},
                 timeout=timeout,
             )

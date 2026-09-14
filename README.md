@@ -33,6 +33,7 @@ pyspeed --no-upload                  # skip upload
 pyspeed --no-ping                    # skip ping
 pyspeed --bytes 50000000             # download 50 MB
 pyspeed --upload-bytes 10000000      # upload 10 MB
+pyspeed --timeout 10                 # allow 10 seconds per network request
 pyspeed --version                    # print the installed version
 ```
 

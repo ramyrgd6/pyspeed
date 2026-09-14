@@ -51,3 +51,35 @@ def test_measure_download_raises_for_http_error(monkeypatch):
 
     with pytest.raises(core.requests.HTTPError):
         list(core.measure_download(total_bytes=1))
+
+
+def test_measure_download_rejects_incomplete_response(monkeypatch):
+    response = Mock()
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    response.iter_content.return_value = [b"short"]
+    session = Mock()
+    session.get.return_value = response
+    monkeypatch.setattr(core, "_session", lambda: session)
+
+    with pytest.raises(ConnectionError, match="Download incomplete"):
+        list(core.measure_download(total_bytes=10))
+
+
+def test_measure_upload_uses_fixed_length_stream(monkeypatch):
+    response = Mock()
+    session = Mock()
+
+    def post(_url, data, **_kwargs):
+        uploaded = 0
+        while chunk := data.read(4):
+            uploaded += len(chunk)
+        assert uploaded == 10
+        return response
+
+    session.post.side_effect = post
+    monkeypatch.setattr(core, "_session", lambda: session)
+
+    samples = list(core.measure_upload(total_bytes=10))
+
+    assert samples[-1][1] == 10

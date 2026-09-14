@@ -73,9 +73,13 @@ def _panel(ping, download_mbps, upload_mbps, phase, note=""):
 @click.option("--upload-bytes", default=core.DEFAULT_UPLOAD_BYTES,
               show_default=True, type=click.IntRange(min=1),
               help="Upload payload size in bytes.")
+@click.option("--timeout", default=20.0, show_default=True,
+              type=click.FloatRange(min=0.1),
+              help="Network timeout in seconds for each request.")
 @click.option("--no-upload", is_flag=True, help="Skip the upload phase.")
 @click.option("--no-ping", is_flag=True, help="Skip the ping phase.")
-def main(download_bytes: int, upload_bytes: int, no_upload: bool, no_ping: bool):
+def main(download_bytes: int, upload_bytes: int, timeout: float,
+         no_upload: bool, no_ping: bool):
     """Run a live download/upload/ping speed test in your terminal."""
     ping_result: core.PingResult | None = None
     download_mbps: float | None = None
@@ -88,13 +92,13 @@ def main(download_bytes: int, upload_bytes: int, no_upload: bool, no_ping: bool)
             # --- Ping phase ---
             if not no_ping:
                 live.update(_panel(None, None, None, "ping"))
-                ping_result = core.measure_ping()
+                ping_result = core.measure_ping(timeout=timeout)
                 live.update(_panel(ping_result, None, None, "download"))
 
             # --- Download phase ---
             live.update(_panel(ping_result, None, None, "download"))
             last_speed = 0.0
-            for elapsed, total in core.measure_download(download_bytes):
+            for elapsed, total in core.measure_download(download_bytes, timeout=timeout):
                 if elapsed > 0:
                     last_speed = core.bytes_to_mbps(total, elapsed)
                 live.update(_panel(ping_result, last_speed, None, "download"))
@@ -104,7 +108,7 @@ def main(download_bytes: int, upload_bytes: int, no_upload: bool, no_ping: bool)
             if not no_upload:
                 live.update(_panel(ping_result, download_mbps, None, "upload"))
                 last_speed = 0.0
-                for elapsed, total in core.measure_upload(upload_bytes):
+                for elapsed, total in core.measure_upload(upload_bytes, timeout=timeout):
                     if elapsed > 0:
                         last_speed = core.bytes_to_mbps(total, elapsed)
                     live.update(_panel(ping_result, download_mbps, last_speed, "upload"))

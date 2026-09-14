@@ -1,6 +1,6 @@
 [project]
 name = "pyspeed"
-version = "0.2.0"
+version = "0.3.0"
 description = "A live, terminal internet speed test — Ookla speedtest CLI, but yours."
 readme = "README.md"
 requires-python = ">=3.10"
