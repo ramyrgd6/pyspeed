@@ -27,7 +27,8 @@
 ```
 
 `pyspeed` starts independent ping, download, and upload workers and keeps the
-terminal display live forever. Press `Ctrl+C` when you are done; active network
+terminal display live forever in a fullscreen alternate screen, like `btop`.
+Press `Ctrl+C` when you are done; active network
 sessions close, the terminal is restored, a final summary is shown, and logs
 are flushed.
 

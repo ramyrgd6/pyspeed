@@ -78,23 +78,32 @@ def _dashboard(snapshot: core.StatsSnapshot, phase: str,
         padding=(0, 1),
     )
 
-    metrics = Table.grid(expand=True, padding=(0, 1))
-    metrics.add_column(ratio=1)
-    metrics.add_column(ratio=1)
-    metrics.add_column(ratio=1)
-    metrics.add_row(
-        _metric_panel("Download", snapshot.current_download_mbps,
-                      snapshot.average_download_mbps, snapshot.peak_download_mbps,
-                      snapshot.download_history, "spring_green3", show_graph),
-        _metric_panel("Upload", snapshot.current_upload_mbps,
-                      snapshot.average_upload_mbps, snapshot.peak_upload_mbps,
-                      snapshot.upload_history, "deep_sky_blue1", show_graph),
-        Panel(
-            _health_table(ping, jitter, snapshot.packet_loss_percent,
-                          snapshot.latency_history if show_graph else ()),
-            border_style="bright_white", box=box.ROUNDED, padding=(0, 1),
-        ),
+    download_panel = _metric_panel(
+        "Download", snapshot.current_download_mbps,
+        snapshot.average_download_mbps, snapshot.peak_download_mbps,
+        snapshot.download_history, "spring_green3", show_graph,
     )
+    upload_panel = _metric_panel(
+        "Upload", snapshot.current_upload_mbps,
+        snapshot.average_upload_mbps, snapshot.peak_upload_mbps,
+        snapshot.upload_history, "deep_sky_blue1", show_graph,
+    )
+    health_panel = Panel(
+        _health_table(ping, jitter, snapshot.packet_loss_percent,
+                      snapshot.latency_history if show_graph else ()),
+        border_style="bright_white", box=box.ROUNDED, padding=(0, 1),
+    )
+    metrics = Table.grid(expand=True, padding=(0, 1))
+    if console.size.width < 100:
+        metrics.add_column(ratio=1)
+        metrics.add_column(ratio=1)
+        metrics.add_row(download_panel, upload_panel)
+        metrics.add_row(health_panel, "")
+    else:
+        metrics.add_column(ratio=1)
+        metrics.add_column(ratio=1)
+        metrics.add_column(ratio=1)
+        metrics.add_row(download_panel, upload_panel, health_panel)
 
     windows = Table.grid(expand=True, padding=(0, 1))
     windows.add_column()
@@ -109,11 +118,11 @@ def _dashboard(snapshot: core.StatsSnapshot, phase: str,
     details = Table.grid(expand=True, padding=(0, 1))
     details.add_column()
     details.add_column()
-    details.add_column()
-    details.add_column()
     details.add_row(
         Text(f"DOWNLOADED  {_format_bytes(snapshot.downloaded_bytes)}", style="dim"),
         Text(f"UPLOADED  {_format_bytes(snapshot.uploaded_bytes)}", style="dim"),
+    )
+    details.add_row(
         Text(f"ELAPSED  {snapshot.elapsed_seconds:6.1f}s", style="dim"),
         Text(f"RECONNECTS  {snapshot.reconnects}", style="dim"),
     )
@@ -270,7 +279,7 @@ def main(download_bytes: int, upload_bytes: int, timeout: float,
     runner.start()
     try:
         with Live(_dashboard(stats.snapshot(), "starting", show_graph=not no_graph), console=console,
-                  refresh_per_second=1000 / refresh, screen=False) as live:
+              refresh_per_second=1000 / refresh, screen=True) as live:
             next_log = 0.0
             while not stop_requested:
                 snapshot = stats.snapshot()
