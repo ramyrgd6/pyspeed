@@ -6,4 +6,5 @@ build/
 .venv/
 venv/
 .env
+*.log
 .DS_Store

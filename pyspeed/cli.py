@@ -1,66 +1,63 @@
-"""
-pyspeed — a live, terminal speed test in the spirit of Ookla's speedtest CLI.
-
-Usage:
-    pyspeed                 # run ping + download + upload
-    pyspeed --no-upload      # skip the upload phase
-    pyspeed --bytes 50000000 # use a 50MB download payload instead of 100MB
-"""
+"""Live terminal UI, logging, and graceful signal handling for pyspeed."""
 
 from __future__ import annotations
 
-import sys
+import logging
+import signal
+import time
+from pathlib import Path
 
 import click
+from rich import box
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich import box
 
 from . import core
 
 console = Console()
 
 
-def _metric_panel(label: str, value: str, detail: str, color: str) -> Panel:
+def _format_bytes(value: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(value)
+    for unit in units:
+        if size < 1000 or unit == units[-1]:
+            return f"{size:.1f} {unit}"
+        size /= 1000
+    return f"{size:.1f} TB"
+
+
+def _inline_bars(history: tuple[float, ...], color: str, width: int = 18) -> Text:
+    samples = history[-width:]
+    if not samples:
+        return Text("·" * width, style="grey35")
+    peak = max(max(samples), 1.0)
+    blocks = "▁▂▃▄▅▆▇█"
+    output = "".join(blocks[min(len(blocks) - 1, round(value / peak * (len(blocks) - 1)))] for value in samples)
+    return Text(output.rjust(width, "·"), style=color)
+
+
+def _metric_panel(label: str, current: float, average: float, peak: float,
+                  history: tuple[float, ...], color: str) -> Panel:
     content = Table.grid(padding=(0, 1))
     content.add_row(Text(label.upper(), style="bold bright_white"))
-    content.add_row(Text(value, style=f"bold {color}"))
-    content.add_row(Text(detail, style="dim"))
+    content.add_row(Text(f"{current:7.2f} Mbps", style=f"bold {color}"))
+    content.add_row(_inline_bars(history, color))
+    content.add_row(Text(f"avg {average:.1f} | peak {peak:.1f} Mbps", style="dim"))
     return Panel(content, border_style=color, box=box.ROUNDED, padding=(0, 1))
 
 
-def _progress_bar(current: int, total: int, width: int = 42) -> Text:
-    if total <= 0:
-        return Text("·" * width, style="grey50")
-    filled = min(width, round(width * current / total))
-    return Text("━" * filled, style="bright_cyan") + Text(
-        "━" * (width - filled), style="grey30"
-    )
-
-
-def _dashboard(
-    ping: core.PingResult | None,
-    download_mbps: float | None,
-    upload_mbps: float | None,
-    phase: str,
-    progress_current: int = 0,
-    progress_total: int = 0,
-    current_speed: float = 0.0,
-    note: str = "",
-) -> Group:
-    ping_value = f"{ping.latency_ms:.2f}" if ping else "--"
-    ping_detail = f"jitter {ping.jitter_ms:.2f} ms" if ping else "latency"
-    download_value = f"{download_mbps:.2f}" if download_mbps is not None else "--"
-    upload_value = f"{upload_mbps:.2f}" if upload_mbps is not None else "--"
-
+def _dashboard(snapshot: core.StatsSnapshot, phase: str) -> Group:
+    ping = f"{snapshot.ping_ms:.2f} ms" if snapshot.ping_ms is not None else "--"
+    jitter = f"{snapshot.jitter_ms:.2f} ms" if snapshot.jitter_ms is not None else "--"
     header = Panel(
         Text.assemble(
             ("PYSPEED", "bold bright_white"),
-            ("  /  LIVE NETWORK DIAGNOSTICS", "bold cyan"),
-            ("\nCloudflare edge  ·  speed.cloudflare.com", "dim"),
+            ("  /  CONTINUOUS NETWORK MONITOR", "bold cyan"),
+            ("\nCloudflare edge  ·  download + upload workers active", "dim"),
         ),
         border_style="bright_cyan",
         box=box.ROUNDED,
@@ -72,127 +69,114 @@ def _dashboard(
     metrics.add_column(ratio=1)
     metrics.add_column(ratio=1)
     metrics.add_row(
-        _metric_panel("Ping", ping_value, f"ms  ·  {ping_detail}", "bright_white"),
-        _metric_panel("Download", download_value, "Mbps", "spring_green3"),
-        _metric_panel("Upload", upload_value, "Mbps", "deep_sky_blue1"),
-    )
-
-    phase_title = phase.upper() if phase != "done" else "COMPLETE"
-    phase_color = "green" if phase == "done" else "bright_cyan"
-    phase_table = Table.grid(expand=True, padding=(0, 1))
-    phase_table.add_column()
-    phase_table.add_column(justify="right")
-    phase_table.add_row(
-        Text(f"●  {phase_title}", style=f"bold {phase_color}"),
-        Text(note or "measuring", style="dim"),
-    )
-    phase_table.add_row(
-        _progress_bar(progress_current, progress_total),
-        Text(
-            f"{current_speed:.2f} Mbps" if current_speed else "warming up",
-            style="bold white",
+        _metric_panel("Download", snapshot.current_download_mbps,
+                      snapshot.average_download_mbps, snapshot.peak_download_mbps,
+                      snapshot.download_history, "spring_green3"),
+        _metric_panel("Upload", snapshot.current_upload_mbps,
+                      snapshot.average_upload_mbps, snapshot.peak_upload_mbps,
+                      snapshot.upload_history, "deep_sky_blue1"),
+        Panel(
+            _health_table(ping, jitter, snapshot.packet_loss_percent),
+            border_style="bright_white", box=box.ROUNDED, padding=(0, 1),
         ),
     )
-    activity = Panel(phase_table, border_style="grey35", box=box.ROUNDED, padding=(0, 1))
 
-    return Group(header, metrics, activity)
+    details = Table.grid(expand=True, padding=(0, 1))
+    details.add_column()
+    details.add_column()
+    details.add_column()
+    details.add_column()
+    details.add_row(
+        Text(f"DOWNLOADED  {_format_bytes(snapshot.downloaded_bytes)}", style="dim"),
+        Text(f"UPLOADED  {_format_bytes(snapshot.uploaded_bytes)}", style="dim"),
+        Text(f"ELAPSED  {snapshot.elapsed_seconds:6.1f}s", style="dim"),
+        Text(f"LOSS  {snapshot.packet_loss_percent:5.1f}%", style="dim"),
+    )
+    status = snapshot.last_error or f"{phase.upper()}  ·  Ctrl+C to stop"
+    footer = Panel(Text(status, style="yellow" if snapshot.last_error else "dim"),
+                   border_style="grey35", box=box.ROUNDED, padding=(0, 1))
+    return Group(header, metrics, details, footer)
+
+
+def _health_table(ping: str, jitter: str, loss: float) -> Table:
+    table = Table.grid(padding=(0, 1))
+    table.add_row(Text("NETWORK HEALTH", style="bold bright_white"))
+    table.add_row(Text(f"ping       {ping}", style="bold white"))
+    table.add_row(Text(f"jitter     {jitter}", style="dim"))
+    table.add_row(Text(f"packet loss {loss:.1f}%", style="dim"))
+    return table
+
+
+def _configure_logging(path: str) -> tuple[logging.Logger, logging.Handler]:
+    handler = logging.FileHandler(Path(path), encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger = logging.getLogger("pyspeed")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    return logger, handler
 
 
 @click.command()
 @click.version_option(package_name="pyspeed")
 @click.option("--bytes", "download_bytes", default=core.DEFAULT_DOWNLOAD_BYTES,
               show_default=True, type=click.IntRange(min=1),
-              help="Download payload size in bytes.")
+              help="Payload size for each download request.")
 @click.option("--upload-bytes", default=core.DEFAULT_UPLOAD_BYTES,
               show_default=True, type=click.IntRange(min=1),
-              help="Upload payload size in bytes.")
+              help="Payload size for each upload request.")
 @click.option("--timeout", default=20.0, show_default=True,
-              type=click.FloatRange(min=0.1),
-              help="Network timeout in seconds for each request.")
-@click.option("--no-upload", is_flag=True, help="Skip the upload phase.")
-@click.option("--no-ping", is_flag=True, help="Skip the ping phase.")
+              type=click.FloatRange(min=0.1), help="Network timeout in seconds.")
+@click.option("--refresh", default=10.0, show_default=True,
+              type=click.FloatRange(min=1.0), help="UI refreshes per second.")
+@click.option("--log-file", default="pyspeed.log", show_default=True,
+              type=click.Path(dir_okay=False), help="Session log file path.")
+@click.option("--no-upload", is_flag=True, help="Disable the upload worker.")
+@click.option("--no-ping", is_flag=True, help="Disable the ping worker.")
 def main(download_bytes: int, upload_bytes: int, timeout: float,
-         no_upload: bool, no_ping: bool):
-    """Run a live download/upload/ping speed test in your terminal."""
-    ping_result: core.PingResult | None = None
-    download_mbps: float | None = None
-    upload_mbps: float | None = None
+         refresh: float, log_file: str, no_upload: bool, no_ping: bool) -> None:
+    """Continuously measure download and upload until Ctrl+C."""
+    logger, handler = _configure_logging(log_file)
+    stats = core.SessionStats()
+    runner = core.NetworkRunner(
+        stats,
+        download_bytes,
+        upload_bytes,
+        timeout,
+        enable_upload=not no_upload,
+        enable_ping=not no_ping,
+    )
+    stop_requested = False
+    previous_handler = signal.getsignal(signal.SIGINT)
 
+    def request_stop(_signum, _frame) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+        runner.stop()
+
+    signal.signal(signal.SIGINT, request_stop)
+    logger.info("session started download_bytes=%s upload_bytes=%s", download_bytes, upload_bytes)
+    runner.start()
     try:
-        with Live(_dashboard(None, None, None, "ping"), console=console,
-                  refresh_per_second=10) as live:
-
-            # --- Ping phase ---
-            if not no_ping:
-                live.update(_dashboard(None, None, None, "ping", note="8 probes"))
-                ping_result = core.measure_ping(timeout=timeout)
-                live.update(_dashboard(ping_result, None, None, "download"))
-
-            # --- Download phase ---
-            live.update(_dashboard(
-                ping_result, None, None, "download", progress_total=download_bytes
-            ))
-            last_speed = 0.0
-            for elapsed, total in core.measure_download(download_bytes, timeout=timeout):
-                if elapsed > 0:
-                    last_speed = core.bytes_to_mbps(total, elapsed)
-                live.update(_dashboard(
-                    ping_result,
-                    last_speed,
-                    None,
-                    "download",
-                    progress_current=total,
-                    progress_total=download_bytes,
-                    current_speed=last_speed,
-                    note=f"{total / download_bytes:.0%} transferred",
-                ))
-            download_mbps = last_speed
-
-            # --- Upload phase ---
-            if not no_upload:
-                live.update(_dashboard(
-                    ping_result,
-                    download_mbps,
-                    None,
-                    "upload",
-                    progress_total=upload_bytes,
-                ))
-                last_speed = 0.0
-                for elapsed, total in core.measure_upload(upload_bytes, timeout=timeout):
-                    if elapsed > 0:
-                        last_speed = core.bytes_to_mbps(total, elapsed)
-                    live.update(_dashboard(
-                        ping_result,
-                        download_mbps,
-                        last_speed,
-                        "upload",
-                        progress_current=total,
-                        progress_total=upload_bytes,
-                        current_speed=last_speed,
-                        note=f"{total / upload_bytes:.0%} transferred",
-                    ))
-                upload_mbps = last_speed
-
-            live.update(_dashboard(
-                ping_result,
-                download_mbps,
-                upload_mbps,
-                "done",
-                progress_current=1,
-                progress_total=1,
-                current_speed=upload_mbps or download_mbps or 0.0,
-                note="results ready",
-            ))
-
-    except ConnectionError as exc:
-        console.print(f"[bold red]Connection error:[/bold red] {exc}")
-        sys.exit(1)
+        with Live(_dashboard(stats.snapshot(), "starting"), console=console,
+                  refresh_per_second=refresh, screen=False) as live:
+            while not stop_requested:
+                live.update(_dashboard(stats.snapshot(), "running"))
+                time.sleep(1 / refresh)
     except KeyboardInterrupt:
-        console.print("\n[yellow]Cancelled.[/yellow]")
-        sys.exit(130)
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[bold red]Unexpected error:[/bold red] {exc}")
-        sys.exit(1)
+        request_stop(signal.SIGINT, None)
+    finally:
+        runner.stop()
+        runner.join(timeout=3.0)
+        final = stats.snapshot()
+        logger.info(
+            "session stopped elapsed=%.1f downloaded=%s uploaded=%s",
+            final.elapsed_seconds, final.downloaded_bytes, final.uploaded_bytes,
+        )
+        handler.flush()
+        logger.removeHandler(handler)
+        handler.close()
+        signal.signal(signal.SIGINT, previous_handler)
+        console.print("[yellow]Stopped cleanly. Logs flushed.[/yellow]")
 
 
 if __name__ == "__main__":

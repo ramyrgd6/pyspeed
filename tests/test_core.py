@@ -1,4 +1,5 @@
 from unittest.mock import Mock
+import time
 
 import pytest
 
@@ -83,3 +84,59 @@ def test_measure_upload_uses_fixed_length_stream(monkeypatch):
     samples = list(core.measure_upload(total_bytes=10))
 
     assert samples[-1][1] == 10
+
+
+def test_session_stats_tracks_totals_averages_and_peaks():
+    stats = core.SessionStats()
+    stats.record_transfer("download", 1_000_000)
+    stats.record_transfer("upload", 500_000)
+
+    snapshot = stats.snapshot()
+
+    assert snapshot.downloaded_bytes == 1_000_000
+    assert snapshot.uploaded_bytes == 500_000
+    assert snapshot.average_download_mbps >= 0
+    assert snapshot.average_upload_mbps >= 0
+    assert snapshot.peak_download_mbps >= 0
+    assert snapshot.peak_upload_mbps >= 0
+
+
+def test_network_runner_starts_workers_and_stops_them():
+    stats = core.SessionStats()
+    runner = core.NetworkRunner(stats, 1, 1, timeout=1)
+    started = []
+
+    def worker():
+        started.append(True)
+        runner.stop_event.wait()
+
+    runner._download_worker = worker
+    runner._upload_worker = worker
+    runner._ping_worker = worker
+    runner.start()
+
+    deadline = time.monotonic() + 1
+    while len(started) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    runner.stop()
+    runner.join(timeout=1)
+
+    assert len(started) == 3
+    assert all(not thread.is_alive() for thread in runner._threads)
+
+
+def test_network_runner_retries_after_temporary_failure():
+    stats = core.SessionStats()
+    runner = core.NetworkRunner(stats, 1, 1, timeout=1)
+    attempts = []
+
+    def attempt():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise core.requests.ConnectionError("temporary")
+        runner.stop_event.set()
+
+    runner._run_with_retry("download", attempt)
+
+    assert len(attempts) == 2
+    assert "download retry" in (stats.snapshot().last_error or "")
