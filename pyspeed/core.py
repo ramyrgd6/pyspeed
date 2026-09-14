@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import logging
+import socket
 import threading
 import time
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 from typing import Literal
 
 import requests
@@ -54,6 +56,12 @@ class StatsSnapshot:
     current_upload_mbps: float
     average_download_mbps: float
     average_upload_mbps: float
+    download_1s_mbps: float
+    upload_1s_mbps: float
+    download_10s_mbps: float
+    upload_10s_mbps: float
+    download_60s_mbps: float
+    upload_60s_mbps: float
     peak_download_mbps: float
     peak_upload_mbps: float
     downloaded_bytes: int
@@ -61,6 +69,17 @@ class StatsSnapshot:
     ping_ms: float | None
     jitter_ms: float | None
     packet_loss_percent: float
+    idle_ping_ms: float | None
+    loaded_ping_ms: float | None
+    latency_increase_ms: float | None
+    reconnects: int
+    temporary_failures: int
+    min_sustained_download_mbps: float
+    min_sustained_upload_mbps: float
+    download_stddev_mbps: float
+    upload_stddev_mbps: float
+    stability: str
+    latency_history: tuple[float, ...] = ()
     download_history: tuple[float, ...] = ()
     upload_history: tuple[float, ...] = ()
     last_error: str | None = None
@@ -81,11 +100,19 @@ class SessionStats:
         self._upload_peak = 0.0
         self._download_history: list[float] = []
         self._upload_history: list[float] = []
+        self._transfer_samples: dict[str, deque[tuple[float, int, float]]] = {
+            "download": deque(maxlen=2048),
+            "upload": deque(maxlen=2048),
+        }
+        self._latency_history: deque[float] = deque(maxlen=120)
         self._last_transfer: dict[str, tuple[int, float]] = {}
         self._ping: PingResult | None = None
         self._ping_attempts = 0
         self._ping_failures = 0
         self._last_error: str | None = None
+        self._idle_ping: float | None = None
+        self._reconnects = 0
+        self._temporary_failures = 0
 
     def record_transfer(self, direction: Literal["download", "upload"], amount: int) -> None:
         now = time.monotonic()
@@ -104,6 +131,7 @@ class SessionStats:
             self._last_transfer[direction] = (total, now)
             history.append(speed)
             del history[:-self._history_limit]
+            self._transfer_samples[direction].append((now, amount, speed))
             if direction == "download":
                 self._download_current = speed
                 self._download_peak = max(self._download_peak, speed)
@@ -118,6 +146,17 @@ class SessionStats:
                 self._ping_failures += 1
             if result is not None:
                 self._ping = result
+                self._latency_history.append(result.latency_ms)
+
+    def set_idle_ping(self, latency_ms: float | None) -> None:
+        with self._lock:
+            self._idle_ping = latency_ms
+
+    def record_failure(self, reconnect: bool = False) -> None:
+        with self._lock:
+            self._temporary_failures += 1
+            if reconnect:
+                self._reconnects += 1
 
     def record_error(self, message: str) -> None:
         with self._lock:
@@ -128,12 +167,35 @@ class SessionStats:
         with self._lock:
             elapsed = max(now - self._started, 0.0)
             loss = (self._ping_failures / self._ping_attempts * 100) if self._ping_attempts else 0.0
+            windows = {
+                direction: {
+                    window: _window_average(samples, now, window)
+                    for window in (1.0, 10.0, 60.0)
+                }
+                for direction, samples in self._transfer_samples.items()
+            }
+            loaded_ping = self._ping.latency_ms if self._ping else None
+            latency_increase = (
+                loaded_ping - self._idle_ping
+                if loaded_ping is not None and self._idle_ping is not None
+                else None
+            )
+            download_values = [sample[2] for sample in self._transfer_samples["download"]]
+            upload_values = [sample[2] for sample in self._transfer_samples["upload"]]
             return StatsSnapshot(
                 elapsed_seconds=elapsed,
                 current_download_mbps=self._download_current,
                 current_upload_mbps=self._upload_current,
-                average_download_mbps=bytes_to_mbps(self._downloaded, elapsed),
-                average_upload_mbps=bytes_to_mbps(self._uploaded, elapsed),
+                # Avoid startup spikes from dividing the first chunk by a
+                # near-zero elapsed time; after 100 ms this is exact.
+                average_download_mbps=bytes_to_mbps(self._downloaded, max(elapsed, 0.1)),
+                average_upload_mbps=bytes_to_mbps(self._uploaded, max(elapsed, 0.1)),
+                download_1s_mbps=windows["download"][1.0],
+                upload_1s_mbps=windows["upload"][1.0],
+                download_10s_mbps=windows["download"][10.0],
+                upload_10s_mbps=windows["upload"][10.0],
+                download_60s_mbps=windows["download"][60.0],
+                upload_60s_mbps=windows["upload"][60.0],
                 peak_download_mbps=self._download_peak,
                 peak_upload_mbps=self._upload_peak,
                 downloaded_bytes=self._downloaded,
@@ -141,17 +203,98 @@ class SessionStats:
                 ping_ms=self._ping.latency_ms if self._ping else None,
                 jitter_ms=self._ping.jitter_ms if self._ping else None,
                 packet_loss_percent=loss,
+                idle_ping_ms=self._idle_ping,
+                loaded_ping_ms=loaded_ping,
+                latency_increase_ms=latency_increase,
+                reconnects=self._reconnects,
+                temporary_failures=self._temporary_failures,
+                min_sustained_download_mbps=min(download_values, default=0.0),
+                min_sustained_upload_mbps=min(upload_values, default=0.0),
+                download_stddev_mbps=_stddev(download_values),
+                upload_stddev_mbps=_stddev(upload_values),
+                stability=_stability(loss, _stddev(download_values), _stddev(upload_values)),
                 download_history=tuple(self._download_history),
                 upload_history=tuple(self._upload_history),
+                latency_history=tuple(self._latency_history),
                 last_error=self._last_error,
             )
 
 
+def _window_average(samples: deque[tuple[float, int, float]], now: float, window: float) -> float:
+    recent = [(timestamp, amount) for timestamp, amount, _ in samples if now - timestamp <= window]
+    if not recent:
+        return 0.0
+    amount = sum(item[1] for item in recent)
+    span = min(window, max(now - recent[0][0], 0.1))
+    return bytes_to_mbps(amount, span)
+
+
+def _stddev(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    return (sum((value - mean) ** 2 for value in values) / len(values)) ** 0.5
+
+
+def _stability(loss: float, download_stddev: float, upload_stddev: float) -> str:
+    variation = download_stddev + upload_stddev
+    if loss > 5 or variation > 100:
+        return "Unstable"
+    if loss > 1 or variation > 50:
+        return "Fair"
+    if variation > 20:
+        return "Good"
+    return "Excellent"
+
+
+def parse_rate(value: str | None) -> float | None:
+    """Parse K/M/G bytes-per-second limits; Mbps suffixes are converted."""
+    if not value:
+        return None
+    normalized = value.strip().upper()
+    suffixes = (("GBPS", 125_000_000), ("MBPS", 125_000), ("KBPS", 125),
+                ("G", 1_000_000_000), ("M", 1_000_000), ("K", 1_000))
+    for suffix, multiplier in suffixes:
+        if normalized.endswith(suffix):
+            return float(normalized[:-len(suffix)]) * multiplier
+    return float(normalized)
+
+
+class RateLimiter:
+    def __init__(self, bytes_per_second: float | None):
+        self.rate = bytes_per_second
+        self._started = time.monotonic()
+        self._sent = 0
+        self._lock = threading.Lock()
+
+    def wait(self, amount: int, stop_event: threading.Event) -> None:
+        if not self.rate:
+            return
+        with self._lock:
+            self._sent += amount
+            target_time = self._started + self._sent / self.rate
+        delay = target_time - time.monotonic()
+        if delay > 0:
+            stop_event.wait(delay)
+
+
+def network_info() -> dict[str, str]:
+    """Return best-effort local network information without optional dependencies."""
+    hostname = socket.gethostname()
+    try:
+        local_ip = socket.gethostbyname(hostname)
+    except OSError:
+        local_ip = "unavailable"
+    return {"hostname": hostname, "local_ip": local_ip, "server": BASE_URL}
+
+
 class _UploadStream:
-    def __init__(self, total_bytes: int, stats: SessionStats, stop_event: threading.Event):
+    def __init__(self, total_bytes: int, stats: SessionStats,
+                 stop_event: threading.Event, limiter: RateLimiter | None = None):
         self.remaining = total_bytes
         self.stats = stats
         self.stop_event = stop_event
+        self.limiter = limiter
 
     def read(self, size: int = -1) -> bytes:
         if self.remaining <= 0 or self.stop_event.is_set():
@@ -159,6 +302,8 @@ class _UploadStream:
         size = CHUNK_SIZE if size < 0 else min(size, CHUNK_SIZE)
         size = min(size, self.remaining)
         self.remaining -= size
+        if self.limiter is not None:
+            self.limiter.wait(size, self.stop_event)
         chunk = os.urandom(size)
         self.stats.record_transfer("upload", len(chunk))
         return chunk
@@ -170,11 +315,14 @@ class NetworkRunner:
     def __init__(self, stats: SessionStats, download_bytes: int, upload_bytes: int,
                  timeout: float = 20.0, ping_interval: float = 1.0,
                  enable_download: bool = True, enable_upload: bool = True,
-                 enable_ping: bool = True):
+                 enable_ping: bool = True, download_limit: float | None = None,
+                 upload_limit: float | None = None, connections: int = 1):
         _validate_transfer(download_bytes, timeout)
         _validate_transfer(upload_bytes, timeout)
         if ping_interval <= 0:
             raise ValueError("ping_interval must be greater than 0")
+        if connections < 1 or connections > 4:
+            raise ValueError("connections must be between 1 and 4")
         self.stats = stats
         self.download_bytes = download_bytes
         self.upload_bytes = upload_bytes
@@ -183,6 +331,9 @@ class NetworkRunner:
         self.enable_download = enable_download
         self.enable_upload = enable_upload
         self.enable_ping = enable_ping
+        self.download_limiter = RateLimiter(download_limit)
+        self.upload_limiter = RateLimiter(upload_limit)
+        self.connections = connections
         self.stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
         self._sessions: set[requests.Session] = set()
@@ -193,9 +344,9 @@ class NetworkRunner:
     def start(self) -> None:
         workers = []
         if self.enable_download:
-            workers.append((self._download_worker, "pyspeed-download"))
+            workers.extend((self._download_worker, f"pyspeed-download-{index + 1}") for index in range(self.connections))
         if self.enable_upload:
-            workers.append((self._upload_worker, "pyspeed-upload"))
+            workers.extend((self._upload_worker, f"pyspeed-upload-{index + 1}") for index in range(self.connections))
         if self.enable_ping:
             workers.append((self._ping_worker, "pyspeed-ping"))
         self._threads = [threading.Thread(target=target, name=name, daemon=True) for target, name in workers]
@@ -250,6 +401,7 @@ class NetworkRunner:
                     if self.stop_event.is_set():
                         return
                     if chunk:
+                        self.download_limiter.wait(len(chunk), self.stop_event)
                         self.stats.record_transfer("download", len(chunk))
             finally:
                 self._unregister_response(response)
@@ -263,7 +415,9 @@ class NetworkRunner:
         session = _session()
         self._register(session)
         try:
-            stream = _UploadStream(self.upload_bytes, self.stats, self.stop_event)
+            stream = _UploadStream(
+                self.upload_bytes, self.stats, self.stop_event, self.upload_limiter
+            )
             response = session.post(
                 UP_URL,
                 data=stream,
@@ -293,6 +447,7 @@ class NetworkRunner:
                     self.stats.record_ping(PingResult(latency, jitter, [latency]), True)
                 except requests.RequestException as exc:
                     self.stats.record_ping(None, False)
+                    self.stats.record_failure()
                     self.stats.record_error(f"ping retry: {exc}")
                     logger.warning("ping retry: %s", exc)
                 self.stop_event.wait(self.ping_interval)
@@ -306,6 +461,7 @@ class NetworkRunner:
                 attempt()
                 delay = RETRY_DELAY
             except (requests.RequestException, ConnectionError) as exc:
+                self.stats.record_failure(reconnect=True)
                 self.stats.record_error(f"{direction} retry: {exc}")
                 logger.warning("%s retry in %.1fs: %s", direction, delay, exc)
                 self.stop_event.wait(delay)

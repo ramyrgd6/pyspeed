@@ -28,7 +28,8 @@
 
 `pyspeed` starts independent ping, download, and upload workers and keeps the
 terminal display live forever. Press `Ctrl+C` when you are done; active network
-sessions close, the terminal is restored, and the session log is flushed.
+sessions close, the terminal is restored, a final summary is shown, and logs
+are flushed.
 
 ## Install
 
@@ -47,8 +48,14 @@ pyspeed --no-ping                    # skip ping
 pyspeed --bytes 50000000             # download 50 MB
 pyspeed --upload-bytes 10000000      # upload 10 MB
 pyspeed --timeout 10                 # allow 10 seconds per network request
-pyspeed --refresh 5                  # refresh the UI five times per second
-pyspeed --log-file session.log      # write lifecycle and retry logs here
+pyspeed --refresh 250                # refresh every 250 ms
+pyspeed --log results.csv            # periodic CSV snapshots
+pyspeed --log results.json           # JSON-lines snapshots
+pyspeed --download-limit 80M         # throttle real download traffic
+pyspeed --upload-limit 30Mbps        # throttle real upload traffic
+pyspeed --connections 2              # two parallel workers per direction
+pyspeed --history 120                # retain a longer scrolling history
+pyspeed --no-graph                   # hide history bars on small terminals
 pyspeed --no-upload                  # run without the upload worker
 pyspeed --version                    # print the installed version
 ```
@@ -64,11 +71,16 @@ pyspeed --bytes 10000000 --upload-bytes 5000000
 - **Ping** sends several tiny requests and reports average round-trip latency
   plus jitter between consecutive samples.
 - **Download and upload** run in independent worker threads, continuously
-  repeating requests and calculating current, average, and peak throughput.
+  repeating requests and calculating current, 1/10/60-second, average, and
+  peak throughput.
 - **Retries** use bounded exponential backoff when a transfer temporarily
-  fails, so a transient network error does not kill the session.
-- **Statistics** track totals, elapsed time, ping, jitter, and packet loss while
-  the UI renders several times per second.
+  fails, so a transient network error does not kill the session. Reconnects and
+  failures are counted.
+- **Latency** records an idle baseline and loaded latency while both workers
+  are active. The displayed increase is a bufferbloat estimate, not an
+  official standardized grade.
+- **Statistics** track totals, elapsed time, jitter, packet loss, variance,
+  stability, and bounded scrolling histories while the UI redraws in place.
 
 The project deliberately has a small surface area: `pyspeed.core` contains the
 measurement logic, while `pyspeed.cli` owns the live terminal presentation.
@@ -86,6 +98,11 @@ python -m compileall -q pyspeed
 Results vary with your connection, route to Cloudflare's edge, and current
 network conditions. This is a personal educational project and is not
 affiliated with Ookla or Cloudflare.
+
+Continuous mode creates sustained traffic. Use it only on connections and
+endpoints you control or are authorized to load. Cloudflare's public endpoint
+is suitable for short personal tests; stop the monitor rather than leaving a
+public service under load indefinitely.
 
 ## License
 

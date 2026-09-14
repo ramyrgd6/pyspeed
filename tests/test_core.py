@@ -140,3 +140,30 @@ def test_network_runner_retries_after_temporary_failure():
 
     assert len(attempts) == 2
     assert "download retry" in (stats.snapshot().last_error or "")
+    assert stats.snapshot().reconnects == 1
+    assert stats.snapshot().temporary_failures == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("80M", 80_000_000), ("30Mbps", 3_750_000), ("500K", 500_000), ("1Gbps", 125_000_000)],
+)
+def test_parse_rate_supports_common_limits(value, expected):
+    assert core.parse_rate(value) == expected
+
+
+def test_snapshot_contains_latency_and_rolling_metrics():
+    stats = core.SessionStats()
+    stats.set_idle_ping(20.0)
+    stats.record_ping(core.PingResult(80.0, 3.0, [80.0]), True)
+    stats.record_transfer("download", 1_000_000)
+    stats.record_transfer("upload", 500_000)
+
+    snapshot = stats.snapshot()
+
+    assert snapshot.idle_ping_ms == 20.0
+    assert snapshot.loaded_ping_ms == 80.0
+    assert snapshot.latency_increase_ms == 60.0
+    assert snapshot.download_1s_mbps >= 0.0
+    assert snapshot.upload_60s_mbps >= 0.0
+    assert snapshot.stability in {"Excellent", "Good", "Fair", "Unstable"}
